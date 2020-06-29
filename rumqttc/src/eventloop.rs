@@ -22,7 +22,7 @@ pub enum ConnectionError {
     MqttState(#[from] StateError),
     #[error("Timeout")]
     Timeout(#[from] Elapsed),
-    #[error("Rumq")]
+    #[error("Parsing error = {0}")]
     Mqtt4Bytes(#[from] mqtt4bytes::Error),
     #[error("Network")]
     Network(#[from] network::Error),
@@ -34,6 +34,14 @@ pub enum ConnectionError {
     RequestsDone,
     #[error("Cancel request by the user")]
     Cancel,
+}
+
+#[derive(Eq, PartialEq)]
+enum NetworkType {
+    /// User provided Framed. No automatic reconnections
+    User,
+    /// Inbuilt. Automatic reconnections available
+    Inbuilt
 }
 
 /// Eventloop with all the state of a connection
@@ -52,8 +60,10 @@ pub struct EventLoop<R: Requests> {
     has_pending: bool,
     /// Network connection to the broker
     network: Option<Framed<Box<dyn N>, MqttCodec>>,
+    /// Network type
+    network_type: NetworkType,
     /// Keep alive time
-    keepalive_timeout: Delay,
+    keepalive_timeout: Option<Delay>,
     /// Handle to read cancellation requests
     cancel_rx: Receiver<()>,
     /// Handle to send cancellation requests (and drops)
@@ -71,6 +81,10 @@ impl<R: Requests> EventLoop<R> {
         let keepalive = options.keep_alive;
         let (cancel_tx, cancel_rx) = bounded(5);
         let requests = time::throttle(options.throttle, requests);
+        let keepalive_timeout = match options.keep_alive.as_secs() {
+            0 => None,
+            _ => Some(time::delay_for(keepalive))
+        };
 
         EventLoop {
             options,
@@ -80,11 +94,19 @@ impl<R: Requests> EventLoop<R> {
             pending_rel: VecDeque::new(),
             has_pending: false,
             network: None,
-            keepalive_timeout: time::delay_for(keepalive),
+            network_type: NetworkType::Inbuilt,
+            keepalive_timeout,
             cancel_rx,
             cancel_tx: Some(cancel_tx),
             reconnection_delay: Duration::from_secs(0),
         }
+    }
+
+    /// Manually set network. Automatic reconnections are disabled in this case
+    /// Use this only if you want to pass your own connection
+    pub async fn set_network(&mut self, network: Framed<Box<dyn N>, MqttCodec>) {
+        self.network = Some(network);
+        self.network_type = NetworkType::User;
     }
 
     /// Set delay between (automatic) reconnections
@@ -106,7 +128,9 @@ impl<R: Requests> EventLoop<R> {
         // outgoing requests. Internal loops inside async functions are risky. Imagine this function
         // with 100 requests and 1 incoming packet. If this `Stream` (which internally loops) is
         // selected with other streams, can potentially do more internal polling (if the socket is ready)
-        if self.network.is_none() {
+
+        // Auto reconnect if the network is down (when using inbuilt network)
+        if self.network.is_none() && self.network_type == NetworkType::Inbuilt {
             self.connect_or_cancel().await?;
         }
 
@@ -138,8 +162,14 @@ impl<R: Requests> EventLoop<R> {
 
     /// Select on network and requests and generate keepalive pings when necessary
     async fn select(&mut self) -> Result<(Option<Incoming>, Option<Outgoing>), ConnectionError> {
-        let network = &mut self.network.as_mut().unwrap();
+        // manual connection from user doesn't trigger reconnection in `poll`. Error out in
+        // those cases
+        let network = match &mut self.network {
+            Some(network) => network,
+            None => return Err(ConnectionError::StreamDone)
+        };
 
+        let keepalive_timeout = &mut self.keepalive_timeout;
         let inflight_full = self.state.outgoing_pub.len() >= self.options.inflight;
         let (incoming, outpacket) = select! {
             // Pull next packet from network
@@ -159,22 +189,23 @@ impl<R: Requests> EventLoop<R> {
             o = next_pending(self.options.throttle, &mut self.pending_pub, &mut self.pending_rel), if self.has_pending => match o {
                 Some(packet) => self.state.handle_outgoing_packet(packet)?,
                 None => {
-                    self.has_pending = false;
                     // this is the only place where poll returns a spurious (None, None)
+                    self.has_pending = false;
                     (None, None)
                 }
             },
             // We generate pings irrespective of network activity. This keeps the ping logic
             // simple. We can change this behavior in future if necessary (to prevent extra pings)
-            _ = &mut self.keepalive_timeout => {
-                self.keepalive_timeout.reset(Instant::now() + self.options.keep_alive);
+            _ = async { keepalive_timeout.as_mut().unwrap().await }, if keepalive_timeout.is_some() => {
+                if let Some(keepalive_timeout) = &mut self.keepalive_timeout {
+                    keepalive_timeout.reset(Instant::now() + self.options.keep_alive);
+                }
+
                 self.state.handle_outgoing_packet(Packet::PingReq)?;
                 (None, Some(Packet::PingReq))
             }
             // cancellation requests to stop the polling
-            _ = self.cancel_rx.next() => {
-                return Err(ConnectionError::Cancel)
-            }
+            _ = self.cancel_rx.next() => return Err(ConnectionError::Cancel)
         };
 
         // write the reply back to the network. flush??
